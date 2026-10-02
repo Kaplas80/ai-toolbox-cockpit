@@ -17,7 +17,7 @@ from ai_toolbox_cockpit.settings import (
 )
 from ai_toolbox_cockpit.widgets import ConfirmModal, SearchableSelect
 
-from .model_manager import get_model, load_models, model_status
+from .model_manager import get_model, load_models, model_status, resolved_files
 from .server_runner import CONTAINER_NAME, build_server_cmd
 
 
@@ -29,6 +29,8 @@ class GufoServerPanel(BackendServerPanel):
         self.platform_id = ""
         self._pending_command: list[str] = []
         self._pending_settings: dict = {}
+        self._next_speculation_preference: str | None = None
+        self._next_vision_preference: str | None = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
@@ -36,22 +38,26 @@ class GufoServerPanel(BackendServerPanel):
             yield Static(
                 "Experimental Strix Halo backend for the source-pinned Gufo ROCm 10.0 image. "
                 "The curated profiles cover Qwen3.8 Flash Next Q4 with optional MTP-7, "
-                "Qwen3.8 27B Q4, and DeepSeek V4 Flash 0731 with optional DSpark.",
+                "Qwen3.8 27B Q4 with optional DFlash2-7, and DeepSeek V4 Flash 0731 "
+                "with optional DSpark.",
                 classes="panel-copy",
             )
             for control, label in (
                 ("engine", "Engine"),
                 ("image", "Image"),
                 ("model", "Model / quant"),
-                ("speculation", "Inference profile"),
+                ("speculation", "Speculative decoding"),
+                ("think", "Thinking effort"),
+                ("vision", "Image input"),
             ):
                 with Horizontal(classes="inline-row"):
                     yield Label(label, id=f"gufo-{control}-label", classes="inline-label")
                     yield SearchableSelect(f"Select {label.lower()}", id=f"gufo-{control}")
             for fields in (
                 (("host", "Host", "127.0.0.1"), ("port", "Port", "18080")),
-                (("context", "Context", "262144"), ("sessions", "Sessions", "1")),
-                (("max-tokens", "Maximum output", "32768"), ("draft-tokens", "MTP draft cap", "7")),
+                (("context", "Context", "262144"), ("sessions", "Concurrent sessions", "1")),
+                (("max-tokens", "Maximum output", "32768"), ("max-pending-per-client", "Queued requests / client", "4")),
+                (("draft-tokens", "Speculative draft cap", "7"),),
             ):
                 with Horizontal(classes="compact-fields"):
                     for control, label, default in fields:
@@ -78,7 +84,30 @@ class GufoServerPanel(BackendServerPanel):
             if settings.get("engine") in dict(engines)
             else (engines[0][1] if engines else "")
         )
-        for control in ("host", "port", "context", "sessions", "max_tokens", "draft_tokens"):
+        think = self.query_one("#gufo-think", SearchableSelect)
+        thinking_efforts = {
+            "off", "auto", "minimal", "low", "medium", "high", "xhigh", "max",
+        }
+        think.set_options([
+            ("Off", "off"),
+            ("Model default", "auto"),
+            ("Minimal", "minimal"),
+            ("Low", "low"),
+            ("Medium", "medium"),
+            ("High", "high"),
+            ("XHigh", "xhigh"),
+            ("Max", "max"),
+        ])
+        thinking_effort = str(settings.get("thinking_effort", ""))
+        if thinking_effort not in thinking_efforts:
+            # Migrate the former on/off control. Its auto/on states become the
+            # new recommended High default; an explicit off remains disabled.
+            thinking_effort = "off" if settings.get("think_mode") == "off" else "high"
+        think.value = thinking_effort
+        for control in (
+            "host", "port", "context", "sessions", "max_tokens",
+            "max_pending_per_client", "draft_tokens",
+        ):
             if control in settings:
                 widget_id = control.replace("_", "-")
                 self.query_one(f"#gufo-{widget_id}", Input).value = str(settings[control])
@@ -118,34 +147,70 @@ class GufoServerPanel(BackendServerPanel):
             for entry in models
         ])
         ids = {entry["id"] for entry in models}
+        preference = settings.get("speculation_mode")
+        self._next_speculation_preference = (
+            str(preference)
+            if preference in {"baseline", "mtp", "dflash2", "dspark"}
+            else None
+        )
+        self._next_vision_preference = "on" if settings.get("vision_enabled", False) else "off"
         select.value = previous if previous in ids else next(
             entry["id"] for entry in models if entry.get("recommended")
         )
-        self._refresh_speculation(settings.get("speculation_mode", "baseline"))
+        self._refresh_vision(self._next_vision_preference)
 
-    def _refresh_speculation(self, preferred: str = "baseline") -> None:
+    def _refresh_speculation(self, preferred: str | None = None) -> None:
         model_id = self.query_one("#gufo-model", SearchableSelect).value
-        options = [("Baseline", "baseline")]
         try:
             model = get_model(model_id)
         except ValueError:
             model = {}
         speculation = model.get("speculation")
+        options = [("Disabled (baseline)", "baseline")]
+        default = "baseline"
         if speculation:
             mode = speculation["mode"]
-            label = "MTP" if mode == "mtp" else "DSpark"
-            options.append((label, mode))
+            label = {"mtp": "MTP", "dflash2": "DFlash2", "dspark": "DSpark"}[mode]
+            sidecar_ready = resolved_files(model)["sidecar"] is not None
+            options.append((
+                f"{label} ({'sidecar ready' if sidecar_ready else 'sidecar missing'})",
+                mode,
+            ))
+            if sidecar_ready:
+                default = mode
             self.query_one("#gufo-context", Input).value = str(model["context_size"])
             if speculation.get("draft_tokens"):
                 self.query_one("#gufo-draft-tokens", Input).value = str(speculation["draft_tokens"])
         select = self.query_one("#gufo-speculation", SearchableSelect)
         select.set_options(options)
         values = {value for _, value in options}
-        select.value = preferred if preferred in values else "baseline"
+        select.value = preferred if preferred in values else default
+
+    def _refresh_vision(self, preferred: str | None = None) -> None:
+        model_id = self.query_one("#gufo-model", SearchableSelect).value
+        try:
+            model = get_model(model_id)
+        except ValueError:
+            model = {}
+        select = self.query_one("#gufo-vision", SearchableSelect)
+        previous = select.value
+        options = [("Text only", "off")]
+        if model.get("vision"):
+            ready = resolved_files(model).get("vision") is not None
+            options.append((f"Text + images ({'projector ready' if ready else 'projector missing'})", "on"))
+        select.set_options(options)
+        select.disabled = not model.get("vision")
+        value = preferred if preferred is not None else previous
+        select.value = value if value in {v for _, v in options} else "off"
 
     @on(SearchableSelect.Changed, "#gufo-model")
     def model_changed(self, event: SearchableSelect.Changed) -> None:
-        self._refresh_speculation()
+        preference = self._next_speculation_preference
+        self._next_speculation_preference = None
+        self._refresh_speculation(preference)
+        vision_preference = self._next_vision_preference
+        self._next_vision_preference = None
+        self._refresh_vision(vision_preference)
 
     @on(Button.Pressed, "#gufo-start")
     def start_pressed(self) -> None:
@@ -160,11 +225,16 @@ class GufoServerPanel(BackendServerPanel):
         try:
             values = {
                 key: self.query_one(f"#gufo-{key.replace('_', '-')}", Input).value.strip()
-                for key in ("host", "port", "context", "sessions", "max_tokens", "draft_tokens")
+                for key in (
+                    "host", "port", "context", "sessions", "max_tokens",
+                    "max_pending_per_client", "draft_tokens",
+                )
             }
             engine = self.query_one("#gufo-engine", SearchableSelect).value
             model_id = self.query_one("#gufo-model", SearchableSelect).value
             speculation_mode = self.query_one("#gufo-speculation", SearchableSelect).value
+            thinking_effort = self.query_one("#gufo-think", SearchableSelect).value
+            vision_enabled = self.query_one("#gufo-vision", SearchableSelect).value == "on"
             extra_args = self.query_one("#gufo-extra-args", TextArea).text.strip()
             self._pending_command = build_server_cmd(
                 engine=engine,
@@ -180,6 +250,9 @@ class GufoServerPanel(BackendServerPanel):
                 context_size=int(values["context"]),
                 sessions=int(values["sessions"]),
                 max_tokens=int(values["max_tokens"]),
+                thinking_effort=thinking_effort,
+                vision_enabled=vision_enabled,
+                max_pending_per_client=int(values["max_pending_per_client"]),
                 draft_tokens=int(values["draft_tokens"]),
                 extra_args=extra_args,
             )
@@ -188,6 +261,8 @@ class GufoServerPanel(BackendServerPanel):
                 "engine": engine,
                 "model_id": model_id,
                 "speculation_mode": speculation_mode,
+                "thinking_effort": thinking_effort,
+                "vision_enabled": vision_enabled,
                 "extra_args": extra_args,
             }
         except (ValueError, OSError) as error:
@@ -198,6 +273,7 @@ class GufoServerPanel(BackendServerPanel):
                 "Start the experimental Gufo server?\n\n"
                 f"{shlex.join(self._pending_command)}",
                 yes_text="Start",
+                copy_text=shlex.join(self._pending_command),
             ),
             self._start_confirmed,
         )

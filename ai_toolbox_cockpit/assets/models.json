@@ -935,6 +935,18 @@
           "id": "ds4-deepseek-v4-1-flash-vision-gguf"
         },
         {
+          "name": "DeepSeek V4.1 Flash — DSpark MXFP4 support (~7.42 GiB)",
+          "family": "deepseek-v4.1-flash",
+          "repo": "kernelpool/DeepSeek-V4.1-Flash-MXFP4-GGUF",
+          "revision": "22a073e51781f43e6814885bb4b3cbe540f175ef",
+          "filename": "DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf",
+          "artifact_role": "dspark_support",
+          "size_gb": 7.966294016,
+          "recommended": false,
+          "sha256": "7a2217ca6ef27cbce4ac934d8b6f59f2f6158ec288527bbe72b86dcbed95d4b5",
+          "id": "ds4-deepseek-v4-1-flash-dspark-mxfp4-gguf"
+        },
+        {
           "name": "Qwen 3.8 Flash Next — Q2 (~137.1 GiB)",
           "family": "qwen3.8-flash-next",
           "repo": "antirez/qwen3.8-flash-next-gguf",
@@ -986,7 +998,13 @@
           "glm-5.3-flash": {
             "standalone_ctx": 262144
           },
-          "deepseek-v4.1-flash": {},
+          "deepseek-v4.1-flash": {
+            "dspark_enabled": true,
+            "dspark_support_filename": "DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf",
+            "dspark_confidence": 0.7,
+            "dspark_confidence_auto": true,
+            "dspark_distributed": true
+          },
           "qwen3.8-flash-next": {}
         },
         "default_server_defaults": {}
@@ -2231,6 +2249,14 @@
             "size_bytes": 2786568256,
             "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6",
             "draft_tokens": 7
+          },
+          "vision": {
+            "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+            "revision": "38bb39ee97821de2c9009abb7e93950eec396e66",
+            "directory": "Qwen3.8-Flash-Next-GGUF-Gufo/vision",
+            "path": "mmproj-BF16.gguf",
+            "size_bytes": 907542944,
+            "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355"
           }
         },
         {
@@ -2250,7 +2276,25 @@
               "size_bytes": 17559178144,
               "sha256": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e"
             }
-          ]
+          ],
+          "speculation": {
+            "mode": "dflash2",
+            "repo": "z-lab/Qwen3.8-27B-DFlash2-GGUF",
+            "revision": "2d9571f8ce46e151f61c6499c99dee6079e1d610",
+            "directory": "Qwen3.8-27B-DFlash2-GGUF",
+            "path": "Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+            "size_bytes": 1143006816,
+            "sha256": "1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd",
+            "draft_tokens": 7
+          },
+          "vision": {
+            "repo": "unsloth/Qwen3.8-27B-GGUF",
+            "revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+            "directory": "Qwen3.8-27B-GGUF/vision",
+            "path": "mmproj-BF16.gguf",
+            "size_bytes": 931146432,
+            "sha256": "83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53"
+          }
         },
         {
           "id": "gufo-deepseek-v4-flash-0731-iq2xxs",

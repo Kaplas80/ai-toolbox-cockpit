@@ -196,6 +196,11 @@ def _validate_model_entry(backend_id: str, entry: dict[str, Any], context: str) 
     elif backend_id == "ds4":
         for key in ("repo", "filename", "family"):
             _required_string(entry, key, context)
+        revision = entry.get("revision")
+        if revision is not None:
+            revision = _required_string(entry, "revision", context)
+            if not re.fullmatch(r"[0-9a-f]{40}", revision):
+                raise CatalogError(f"{context}.revision must pin a full commit SHA")
         artifact_role = entry.get("artifact_role", "main")
         if artifact_role not in {"main", "vision_encoder", "dspark_support", "mtp"}:
             raise CatalogError(f"{context}.artifact_role is unsupported")
@@ -236,13 +241,34 @@ def _validate_model_entry(backend_id: str, entry: dict[str, Any], context: str) 
                 raise CatalogError(f"{context}.files.sha256 must be a SHA256 digest")
         if entry["model_path"] not in paths:
             raise CatalogError(f"{context}.model_path must be included in files")
+        vision = entry.get("vision")
+        if vision is not None:
+            vision_context = f"{context}.vision"
+            if not isinstance(vision, dict):
+                raise CatalogError(f"{vision_context} must be an object")
+            for key in ("repo", "revision", "directory", "path", "sha256"):
+                _required_string(vision, key, vision_context)
+            if vision["repo"] != entry["repo"] or vision["revision"] != entry["revision"]:
+                raise CatalogError(f"{vision_context} must match the target repository and revision")
+            for key in ("directory", "path"):
+                value = vision[key]
+                path = PurePosixPath(value)
+                if path.is_absolute() or ".." in path.parts or "\\" in value or value.startswith("-"):
+                    raise CatalogError(f"{vision_context}.{key} must be a safe relative path")
+            if vision["path"] != "mmproj-BF16.gguf":
+                raise CatalogError(f"{vision_context}.path must name the matching BF16 projector")
+            size = vision.get("size_bytes")
+            if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+                raise CatalogError(f"{vision_context}.size_bytes must be a positive integer")
+            if not re.fullmatch(r"[0-9a-f]{64}", vision["sha256"]):
+                raise CatalogError(f"{vision_context}.sha256 must be a SHA256 digest")
         speculation = entry.get("speculation")
         if speculation is not None:
             if not isinstance(speculation, dict):
                 raise CatalogError(f"{context}.speculation must be an object")
             for key in ("mode", "repo", "revision", "path"):
                 _required_string(speculation, key, f"{context}.speculation")
-            if speculation["mode"] not in {"mtp", "dspark"}:
+            if speculation["mode"] not in {"mtp", "dflash2", "dspark"}:
                 raise CatalogError(f"{context}.speculation.mode is unsupported")
             if not re.fullmatch(r"[0-9a-f]{40}", speculation["revision"]):
                 raise CatalogError(f"{context}.speculation.revision must pin a full commit SHA")
@@ -250,6 +276,15 @@ def _validate_model_entry(backend_id: str, entry: dict[str, Any], context: str) 
             if (PurePosixPath(sidecar_path).is_absolute() or ".." in sidecar_path.split("/")
                     or "\\" in sidecar_path or sidecar_path.startswith("-")):
                 raise CatalogError(f"{context}.speculation.path is invalid")
+            sidecar_directory = speculation.get("directory")
+            if sidecar_directory is not None:
+                sidecar_directory = _required_string(
+                    speculation, "directory", f"{context}.speculation"
+                )
+                directory_path = PurePosixPath(sidecar_directory)
+                if (directory_path.is_absolute() or ".." in directory_path.parts
+                        or "\\" in sidecar_directory or sidecar_directory.startswith("-")):
+                    raise CatalogError(f"{context}.speculation.directory is invalid")
             size = speculation.get("size_bytes")
             if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
                 raise CatalogError(f"{context}.speculation.size_bytes must be a positive integer")
@@ -257,11 +292,16 @@ def _validate_model_entry(backend_id: str, entry: dict[str, Any], context: str) 
             if digest is not None and not re.fullmatch(r"[0-9a-f]{64}", str(digest)):
                 raise CatalogError(f"{context}.speculation.sha256 must be a SHA256 digest")
             draft_tokens = speculation.get("draft_tokens")
-            if speculation["mode"] == "mtp":
+            if speculation["mode"] in {"mtp", "dflash2"}:
                 if not isinstance(draft_tokens, int) or isinstance(draft_tokens, bool) or not 1 <= draft_tokens <= 7:
-                    raise CatalogError(f"{context}.speculation.draft_tokens must be between 1 and 7 for MTP")
+                    raise CatalogError(
+                        f"{context}.speculation.draft_tokens must be between 1 and 7 "
+                        f"for {speculation['mode']}"
+                    )
             elif draft_tokens is not None:
-                raise CatalogError(f"{context}.speculation.draft_tokens is valid only for MTP")
+                raise CatalogError(
+                    f"{context}.speculation.draft_tokens is valid only for MTP or DFlash2"
+                )
     elif backend_id == "vllm":
         _required_string(entry, "repo", context)
         valid_tp = entry.get("valid_tp")
