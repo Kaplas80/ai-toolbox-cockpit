@@ -57,10 +57,6 @@ class CatalogTests(unittest.TestCase):
                 "llama-hrx-staging",
                 "docker.io/kyuz0/amd-strix-halo-toolboxes:hrx-staging",
             ),
-            "strix-halo-llama-rocm-10-0-qwen-3-8-flash-next": (
-                "llama-rocm-10.0-qwen-3.8-flash-next",
-                "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-qwen-3.8-flash-next",
-            ),
             "strix-halo-llama-rocm-10-0-engramhalo": (
                 "llama-rocm-10.0-engramhalo",
                 "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-engramhalo",
@@ -96,11 +92,14 @@ class CatalogTests(unittest.TestCase):
     def test_r9700_toolboxes_match_the_active_source_images(self) -> None:
         catalog = load_toolbox_catalog()
         expected = {
+            "r9700-tcclaviger-flash-next-tp2": "docker.io/tcclaviger/vllm:latest",
+            "r9700-radiance-fp8-tp2": "docker.io/kyuz0/amd-r9700-vllm-toolboxes:radiance",
+            "r9700-r9v-v044-rocm-10": "docker.io/kyuz0/amd-r9700-toolboxes:r9v-rocm-10.0-current",
+            "r9700-ggz14-mxfp4-tp1": "docker.io/kyuz0/amd-r9700-vllm-toolboxes:ggz14-tp1",
+            "r9700-vllm-714-fp8": "docker.io/kyuz0/vllm-therock-gfx1201:native-fp8",
             "r9700-llama-rocm-10-0": "docker.io/kyuz0/amd-r9700-toolboxes:rocm-10.0",
-            "r9700-r9v-rocm-10-0": "docker.io/kyuz0/amd-r9700-toolboxes:r9v-rocm-10.0",
             "r9700-llama-therock-nightly": "docker.io/kyuz0/amd-r9700-toolboxes:therock-nightly",
             "r9700-llama-vulkan-radv": "docker.io/kyuz0/amd-r9700-toolboxes:vulkan-radv",
-            "r9700-llama-vulkan-rocmfpx": "docker.io/kyuz0/amd-r9700-toolboxes:vulkan-rocmfpx",
         }
 
         toolboxes = {
@@ -117,7 +116,6 @@ class CatalogTests(unittest.TestCase):
             self.assertTrue(toolboxes[toolbox_id].supports_load_mode)
         for toolbox_id in (
             "r9700-llama-therock-nightly",
-            "r9700-llama-vulkan-rocmfpx",
         ):
             self.assertFalse(toolboxes[toolbox_id].supports_load_mode)
         self.assertEqual(
@@ -336,16 +334,6 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(
             model["auxiliary_downloads"],
             [{
-                "name": "drluoto MTP sidecars",
-                "repo": "drluoto/Qwen3.8-Flash-Next-MTP-GGUF",
-                "role": "mtp",
-                "recommended_filename": "mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
-                "description": (
-                    "External MTP heads for the Strix Halo Flash Next fork. "
-                    "Q8_0 is the ROCm-validated default; Q4_K_M and bf16 remain "
-                    "available as alternatives."
-                ),
-            }, {
                 "name": "EngramHalo Strix Halo MTP sidecar",
                 "repo": "EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF",
                 "role": "mtp",
@@ -379,20 +367,20 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(
             recommended["model_filename_pattern"], "*UD-Q2_K_XL*.gguf"
         )
-        self.assertEqual(defaults["context_size"], 262144)
+        self.assertEqual(defaults["context_size"], 68096)
         self.assertEqual(defaults["batch_size"], 2048)
         self.assertEqual(defaults["ubatch_size"], 1024)
         self.assertIsNone(defaults["gpu_layers"])
         self.assertEqual(defaults["parallel_sequences"], 1)
         self.assertEqual(defaults["kv_cache_type"], "q8_0")
         self.assertEqual(defaults["load_mode"], "mmap")
-        self.assertEqual(defaults["hip_devices"], "0,1")
+        self.assertNotIn("hip_devices", defaults)
         self.assertFalse(defaults["mtp_enabled"])
         self.assertIn("--split-mode layer", defaults["extra_args"])
         self.assertIn("--fit-target 2048,2048", defaults["extra_args"])
         self.assertIn("--lazy-mode on", defaults["extra_args"])
         self.assertTrue(any("two AMD Radeon AI PRO R9700" in note for note in recommended["notes"]))
-        self.assertTrue(any("ROCm/HIP is recommended over Vulkan" in note for note in recommended["notes"]))
+        self.assertTrue(any("disk-backed" in note.lower() for note in recommended["notes"]))
 
     def test_llama_downloads_offer_every_qwen38_rocmfpx_gguf(self) -> None:
         repo = "julianmb/Qwen-3.8-27B-ROCmFP4-FAST-GGUF"
@@ -467,29 +455,12 @@ class CatalogTests(unittest.TestCase):
         with self.assertRaisesRegex(CatalogError, "must declare exactly"):
             ToolboxCatalog.from_dict(data)
 
-    def test_flash_next_toolbox_recommended_use_is_strix_only_and_structured(self) -> None:
-        catalog = load_toolbox_catalog()
-        toolbox_id = "strix-halo-llama-rocm-10-0-qwen-3-8-flash-next"
-        toolbox = catalog.toolboxes[toolbox_id]
-        recommended = toolbox.backend_config["recommended_use"]
-
-        self.assertIn(toolbox_id, catalog.platform("strix-halo").toolbox_ids)
-        for platform_id in ("r9700", "gb10", "intel-b70"):
-            self.assertNotIn(toolbox_id, catalog.platform(platform_id).toolbox_ids)
-        self.assertEqual(recommended["platform_id"], "strix-halo")
-        self.assertEqual(recommended["model_filename_pattern"], "*UD-IQ4_XS*.gguf")
-        self.assertEqual(recommended["server_defaults"]["load_mode"], "dio")
-        self.assertEqual(
-            recommended["server_defaults"]["mtp"]["spec_types"],
-            ["draft-mtp", "ngram-mod"],
-        )
-
     def test_toolbox_catalog_rejects_invalid_recommended_use_load_mode(self) -> None:
         data = self.asset("toolboxes.json")
         toolbox = next(
             entry
             for entry in data["toolboxes"]
-            if entry["id"] == "strix-halo-llama-rocm-10-0-qwen-3-8-flash-next"
+            if entry["id"] == "strix-halo-llama-rocm-10-0-engramhalo"
         )
         toolbox["backend_config"]["recommended_use"]["server_defaults"][
             "load_mode"
@@ -537,7 +508,7 @@ class CatalogTests(unittest.TestCase):
         toolbox = next(
             entry
             for entry in data["toolboxes"]
-            if entry["id"] == "strix-halo-llama-rocm-10-0-qwen-3-8-flash-next"
+            if entry["id"] == "strix-halo-llama-rocm-10-0-engramhalo"
         )
         recommended = toolbox["backend_config"]["recommended_use"]
         recommended.pop("sidecar")

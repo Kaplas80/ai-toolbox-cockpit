@@ -1,6 +1,8 @@
 """vLLM direct-container server UI."""
 
 import shlex
+import subprocess
+import json
 import shutil
 from pathlib import Path
 
@@ -21,15 +23,18 @@ from ai_toolbox_cockpit.widgets import (
     SearchableSelect,
 )
 
+from .model_manager import checkpoint_ready, requires_preparation
 from .runner import (
     VllmCachePaths,
     apply_toolbox_policy_overrides,
+    apply_gpu_profile,
     build_server_cmd,
+    build_device_probe_cmd,
     default_cache_paths,
 )
 
 
-ATTENTION_BACKENDS = ("TRITON_ATTN", "ROCM_ATTN", "ROCM_AITER_UNIFIED_ATTN")
+ATTENTION_BACKENDS = ("TRITON_ATTN", "ROCM_ATTN", "ROCM_AITER_UNIFIED_ATTN", "R4D")
 
 
 def validate_compiled_cache_roots(caches: VllmCachePaths) -> tuple[Path, Path, Path]:
@@ -62,6 +67,8 @@ class VllmServerPanel(BackendServerPanel):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.platform_id = ""
+        self._pending_legacy_model = ""
+        self._pending_gpu_profile = ""
         self._pending_command: list[str] = []
         self._pending_caches = default_cache_paths()
         self._policy_by_id: dict[str, dict] = {}
@@ -70,7 +77,7 @@ class VllmServerPanel(BackendServerPanel):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            yield Label(self.backend_label, classes="panel-title")
+            yield Label(self.backend_label, id="vllm-server-title", classes="panel-title")
             yield Static(
                 "Launch a curated Hugging Face repository with maintained defaults for tensor parallelism, attention, eager mode, environment, and extra flags.",
                 classes="panel-copy",
@@ -81,6 +88,11 @@ class VllmServerPanel(BackendServerPanel):
             with Horizontal(classes="inline-row"):
                 yield Label("Toolbox image", id="vllm-image-label", classes="inline-label")
                 yield SearchableSelect("Search vLLM images", id="vllm-image")
+            with Horizontal(classes="inline-row", id="vllm-gpu-profile-row"):
+                yield Label("GPU build", id="vllm-gpu-profile-label", classes="inline-label")
+                yield SearchableSelect("Select card setup", id="vllm-gpu-profile")
+                yield Button("Download / Update build", id="vllm-pull-build")
+            yield Static("", id="vllm-gpu-profile-note", classes="panel-copy")
             with Horizontal(classes="inline-row"):
                 yield Label("Curated model", id="vllm-model-label", classes="inline-label")
                 yield SearchableSelect("Search maintained model defaults", id="vllm-model")
@@ -88,6 +100,26 @@ class VllmServerPanel(BackendServerPanel):
                 yield Label("Custom HF repo", id="vllm-custom-model-label", classes="inline-label")
                 yield Input(placeholder="Optional owner/model; uses generic defaults", id="vllm-custom-model")
 
+            with Horizontal(classes="inline-row"):
+                yield Label("Local model directory", id="vllm-local-model-label", classes="inline-label")
+                yield Input(placeholder="Optional prepared snapshot; mounted read-only", id="vllm-local-model")
+
+            with Horizontal(classes="inline-row"):
+                yield Label("Speculative decoding", id="vllm-speculation-label", classes="inline-label")
+                yield SearchableSelect("Select decoding mode", id="vllm-speculation")
+            with Horizontal(classes="inline-row"):
+                yield Label("Draft model directory", id="vllm-draft-label", classes="inline-label")
+                yield Input(placeholder="Local DFlash2 snapshot; mounted read-only", id="vllm-draft")
+
+            with Horizontal(classes="inline-row"):
+                yield Label("Server allocation", id="vllm-allocation-label", classes="inline-label")
+                yield SearchableSelect("Everyday or measured allocation", id="vllm-allocation")
+            yield Static("", id="vllm-allocation-note", classes="panel-copy")
+            with Horizontal(classes="inline-row"):
+                yield Label("GPU indices", id="vllm-devices-label", classes="inline-label")
+                yield Input(placeholder="Indices from device discovery", id="vllm-devices")
+                yield Button("Discover GPUs", id="vllm-discover-devices")
+            yield Static("", id="vllm-device-inventory", classes="panel-copy")
             with Vertical(classes="server-settings"):
                 yield Label("Runtime limits", classes="settings-title")
                 with Horizontal(classes="compact-fields"):
@@ -145,6 +177,9 @@ class VllmServerPanel(BackendServerPanel):
                         value=False,
                         id="vllm-reset-caches",
                     )
+            with Horizontal(classes="inline-row", id="vllm-offload-row"):
+                yield Label("NVMe PLE/cache directory", id="vllm-offload-cache-label", classes="inline-label")
+                yield Input(placeholder="tcclaviger persistent NVMe storage", id="vllm-offload-cache")
             with Horizontal(classes="inline-row"):
                 yield Label("API key", id="vllm-api-key-label", classes="inline-label")
                 yield Input(placeholder="Optional OpenAI-compatible API key", password=True, id="vllm-api-key")
@@ -176,9 +211,10 @@ class VllmServerPanel(BackendServerPanel):
             ("#vllm-compile-cache", "vllm_cache", cache_defaults.vllm),
             ("#vllm-triton-cache", "triton_cache", cache_defaults.triton),
             ("#vllm-aiter-cache", "aiter_cache", cache_defaults.aiter),
+            ("#vllm-offload-cache", "offload_cache", cache_defaults.offload),
         ):
             self.query_one(field, Input).value = str(settings.get(key, fallback))
-        entries = self.app.model_catalog.backends["vllm"].entries
+        entries = [entry for entry in self.app.model_catalog.backends["vllm"].entries if entry.get("artifact_role") != "draft"]
         self._policy_by_id = {str(entry["id"]): dict(entry) for entry in entries}
         model = self.query_one("#vllm-model", SearchableSelect)
         model.set_options([(f"{entry.get('name', entry['repo'])} — {entry['repo']}", entry["id"]) for entry in entries])
@@ -209,7 +245,23 @@ class VllmServerPanel(BackendServerPanel):
             "vllm", platform_id,
             self.app.toolbox_catalog.platform(platform_id).defaults.get("vllm", ""),
         )
+        resolved = self.app.toolbox_catalog.resolve_toolbox_id(default)
+        selected = self.app.toolbox_catalog.toolboxes.get(resolved)
+        self._pending_legacy_model = (selected.backend_config or {}).get("legacy_default_models", {}).get(default, "") if selected else ""
+        self._pending_gpu_profile = default if selected and default in (selected.backend_config or {}).get("gpu_profiles", {}) else ""
+        default = resolved
         select.value = default if default in {toolbox.id for toolbox in toolboxes} else (toolboxes[0].id if toolboxes else "")
+
+    def select_engine(self, toolbox_id: str, label: str) -> None:
+        self.query_one("#vllm-server-title", Label).update(f"{label} Server")
+        image = self.query_one("#vllm-image", SearchableSelect)
+        image.parent.display = not bool(toolbox_id)
+        custom = self.query_one("#vllm-custom-model", Input)
+        custom.parent.display = not bool(toolbox_id)
+        if toolbox_id:
+            custom.value = ""
+        if toolbox_id and image.value != toolbox_id:
+            image.value = toolbox_id
 
     @on(SearchableSelect.Changed, "#vllm-model")
     def model_changed(self, event: SearchableSelect.Changed) -> None:
@@ -217,26 +269,137 @@ class VllmServerPanel(BackendServerPanel):
 
     @on(SearchableSelect.Changed, "#vllm-image")
     def image_changed(self) -> None:
-        self._apply_model_policy(
-            str(self.query_one("#vllm-model", SearchableSelect).value)
-        )
+        toolbox = self.app.toolbox_catalog.toolboxes.get(str(self.query_one("#vllm-image", SearchableSelect).value))
+        profiles = (toolbox.backend_config or {}).get("gpu_profiles", {}) if toolbox else {}
+        gpu_select = self.query_one("#vllm-gpu-profile", SearchableSelect)
+        self.query_one("#vllm-gpu-profile-row").display = bool(profiles)
+        previous_gpu = self._pending_gpu_profile or str(gpu_select.value)
+        self._pending_gpu_profile = ""
+        gpu_select.set_options([(profile["name"], key) for key, profile in profiles.items()])
+        selected_gpu = previous_gpu if previous_gpu in profiles else next(iter(profiles), "")
+        if gpu_select.value != selected_gpu:
+            gpu_select.value = selected_gpu
+        self._update_gpu_profile_note()
+        supported = (toolbox.backend_config or {}).get("supported_model_ids") if toolbox else None
+        entries = [entry for entry in self._policy_by_id.values()
+                   if (not supported or entry["id"] in supported)
+                   and (not entry.get("toolbox_ids") or (toolbox and toolbox.id in entry["toolbox_ids"]))]
+        model = self.query_one("#vllm-model", SearchableSelect)
+        previous = self._pending_legacy_model or str(model.value)
+        self._pending_legacy_model = ""
+        model.set_options([(f"{entry.get('name', entry['repo'])} — {entry['repo']}", entry["id"]) for entry in entries])
+        model.value = previous if previous in {entry["id"] for entry in entries} else (entries[0]["id"] if entries else "")
+        self._apply_model_policy(str(model.value))
 
-    def _effective_policy(self, policy: dict, toolbox_id: str = "") -> dict:
+    @on(SearchableSelect.Changed, "#vllm-allocation")
+    def allocation_changed(self) -> None:
+        toolbox = self.app.toolbox_catalog.toolboxes.get(str(self.query_one("#vllm-image", SearchableSelect).value))
+        profiles = toolbox.backend_config.get("performance_profiles", {}) if toolbox else {}
+        profile = profiles.get(str(self.query_one("#vllm-allocation", SearchableSelect).value), {})
+        policy = self._effective_policy(self._policy_by_id.get(str(self.query_one("#vllm-model", SearchableSelect).value), {}))
+        self.query_one("#vllm-seqs", Input).value = str(profile.get("server_defaults", {}).get("max_num_seqs", policy.get("default_max_num_seqs", 1)))
+        self.query_one("#vllm-allocation-note", Static).update(profile.get("note", policy.get("profile_note", "One sequence for everyday serving.")))
+        if profile:
+            self.query_one("#vllm-speculation", SearchableSelect).value = "baseline"
+
+    @on(Button.Pressed, "#vllm-discover-devices")
+    def discover_devices(self) -> None:
+        try:
+            engine = str(self.query_one("#vllm-engine", SearchableSelect).value)
+            toolbox = self.app.toolbox_catalog.toolboxes.get(str(self.query_one("#vllm-image", SearchableSelect).value))
+            if not toolbox:
+                raise ValueError("Select an installed image")
+            arguments = list(self.app.toolbox_catalog.runtime_profiles[toolbox.runtime_profile].engine_args)
+            toolbox = self._selected_toolbox()
+            command = build_device_probe_cmd(engine, toolbox.image, arguments)
+            with self.app.suspend():
+                output = subprocess.check_output(command, text=True, stderr=subprocess.STDOUT)
+            records = json.loads(output.splitlines()[-1])
+            self.query_one("#vllm-device-inventory", Static).update("\n".join(f"{item['index']}: {item['name']} ({item['architecture']})" for item in records) or "No GPUs discovered.")
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            self.notify(f"Device discovery failed: {error}", severity="error")
+
+    def _selected_toolbox(self, toolbox_id: str = ""):
         toolbox = self.app.toolbox_catalog.toolboxes.get(
             toolbox_id or str(self.query_one("#vllm-image", SearchableSelect).value)
         )
-        return apply_toolbox_policy_overrides(
-            policy,
-            toolbox.backend_config if toolbox else None,
-        )
+        if not toolbox:
+            return None
+        profiles = (toolbox.backend_config or {}).get("gpu_profiles", {})
+        selected = str(self.query_one("#vllm-gpu-profile", SearchableSelect).value)
+        return apply_gpu_profile(toolbox, selected if selected in profiles else "")
+
+    def _update_gpu_profile_note(self) -> None:
+        toolbox = self._selected_toolbox()
+        note = self.query_one("#vllm-gpu-profile-note", Static)
+        note.display = bool(toolbox and (toolbox.backend_config or {}).get("gpu_profiles"))
+        note.update(f"Selected build: {toolbox.image}. Missing images download on first launch; use Download / Update build to refresh this channel." if toolbox else "")
+
+    @on(SearchableSelect.Changed, "#vllm-gpu-profile")
+    def gpu_profile_changed(self) -> None:
+        self._update_gpu_profile_note()
+        self._apply_model_policy(str(self.query_one("#vllm-model", SearchableSelect).value))
+        # Do not carry a one-card device override into the dual-card profile.
+        self.query_one("#vllm-devices", Input).value = ""
+
+    @on(Button.Pressed, "#vllm-pull-build")
+    def pull_build_pressed(self) -> None:
+        toolbox = self._selected_toolbox()
+        engine = str(self.query_one("#vllm-engine", SearchableSelect).value)
+        if not toolbox or engine not in {"podman", "docker"}:
+            self.notify("Select a container engine and GPU build.", severity="error")
+            return
+        command = [engine, "pull", toolbox.image]
+        self.app.push_screen(ConfirmModal(f"Download / update this build?\n\n{shlex.join(command)}", yes_text="Download / Update"),
+                             lambda confirmed: self._pull_build_confirmed(confirmed, command))
+
+    def _pull_build_confirmed(self, confirmed: bool, command: list[str]) -> None:
+        if not confirmed:
+            return
+        try:
+            with self.app.suspend():
+                subprocess.run(command, check=True)
+        except (OSError, subprocess.SubprocessError) as error:
+            self.notify(f"Build download failed: {error}", severity="error")
+            return
+        self.notify("Selected GPU build is ready.")
+
+    def _effective_policy(self, policy: dict, toolbox_id: str = "") -> dict:
+        toolbox = self._selected_toolbox(toolbox_id)
+        return apply_toolbox_policy_overrides(policy, toolbox.backend_config if toolbox else None)
 
     def _apply_model_policy(self, model_id: str) -> None:
         policy = self._effective_policy(self._policy_by_id.get(model_id, {}))
+        speculation = self.query_one("#vllm-speculation", SearchableSelect)
+        self.query_one("#vllm-offload-row").display = policy.get("runtime_variant") == "tcclaviger"
+        default_speculation = policy.get("default_speculation", "baseline")
+        options = [] if default_speculation == "mtp" else [("Baseline", "baseline")]
+        if "mtp" in policy.get("speculation", {}):
+            options.append(("MTP · 3 draft tokens (embedded)", "mtp"))
+        if "dflash2" in policy.get("speculation", {}):
+            options.append(("DFlash2 · 7 draft tokens", "dflash2"))
+        speculation.set_options(options)
+        speculation.value = default_speculation
+        self.query_one("#vllm-draft", Input).value = ""
+        self.query_one("#vllm-draft", Input).disabled = True
         valid_tp = [int(value) for value in policy.get("valid_tp", [1])]
         tp = self.query_one("#vllm-tp", SearchableSelect)
         tp.set_options([(str(value), str(value)) for value in valid_tp])
         tp.value = str(valid_tp[0])
-        self.query_one("#vllm-seqs", Input).value = "1"
+        toolbox = self.app.toolbox_catalog.toolboxes.get(str(self.query_one("#vllm-image", SearchableSelect).value))
+        profiles = toolbox.backend_config.get("performance_profiles", {}) if toolbox else {}
+        allocation = self.query_one("#vllm-allocation", SearchableSelect)
+        allocation.set_options([("Measured · 64 GB / TP2" if default_speculation == "mtp" else "Everyday · one sequence", "everyday")] + [(profile["name"], key) for key, profile in profiles.items()])
+        allocation.value = "everyday"
+        self.query_one("#vllm-devices", Input).value = str(get_backend_settings("vllm").get("devices", ""))
+        self.query_one("#vllm-seqs", Input).value = str(policy.get("default_max_num_seqs", 1))
+        self.query_one("#vllm-allocation-note", Static).update(policy.get("profile_note", "One sequence for everyday serving."))
+        paths = get_backend_settings("vllm").get("artifact_paths", {}).get(model_id, {})
+        local_directory = str(paths.get("prepared" if requires_preparation(policy) else "source", policy.get("local_directory", "")))
+        if local_directory and not policy.get("requires_local_model") and not checkpoint_ready(Path(local_directory).expanduser()):
+            local_directory = ""
+        self.query_one("#vllm-local-model", Input).value = local_directory
+        self.query_one("#vllm-util", Input).value = str(policy.get("gpu_memory_utilization", 0.90))
         self.query_one("#vllm-context", Input).value = str(policy.get("ctx", "auto"))
         self.query_one("#vllm-eager", Checkbox).value = bool(policy.get("enforce_eager", False))
         configured_attention = policy.get("attention_backend", "TRITON_ATTN")
@@ -256,15 +419,31 @@ class VllmServerPanel(BackendServerPanel):
             attention.value = str(configured_attention)
             attention_label.update("Attention backend")
 
+    @on(SearchableSelect.Changed, "#vllm-speculation")
+    def speculation_changed(self, event: SearchableSelect.Changed) -> None:
+        policy = self._effective_policy(self._policy_by_id.get(str(self.query_one("#vllm-model", SearchableSelect).value), {}))
+        recipe = policy.get("speculation", {}).get(str(event.value), {})
+        draft = self.query_one("#vllm-draft", Input)
+        draft.disabled = str(event.value) != "dflash2"
+        draft.value = str(recipe.get("local_directory", ""))
+        self.query_one("#vllm-util", Input).value = str(recipe.get("gpu_memory_utilization", policy.get("gpu_memory_utilization", 0.90)))
+        if recipe and str(event.value) == "dflash2":
+            self.query_one("#vllm-allocation", SearchableSelect).value = "everyday"
+            self.query_one("#vllm-seqs", Input).value = "1"
+
     def cache_paths(self) -> VllmCachePaths:
         return VllmCachePaths(*(
             Path(self.query_one(field, Input).value).expanduser().resolve()
-            for field in ("#vllm-hf-cache", "#vllm-compile-cache", "#vllm-triton-cache", "#vllm-aiter-cache")
+            for field in ("#vllm-hf-cache", "#vllm-compile-cache", "#vllm-triton-cache", "#vllm-aiter-cache", "#vllm-offload-cache")
         ))
 
     @on(Button.Pressed, "#vllm-save-caches")
     def save_caches_pressed(self) -> None:
         try:
+            draft_value = self.query_one("#vllm-draft", Input).value.strip()
+            draft_directory = Path(draft_value).expanduser().resolve() if draft_value else None
+            if draft_directory is not None and not checkpoint_ready(draft_directory, draft=True):
+                raise ValueError("Draft model directory must contain the complete DFlash2 checkpoint and config.json")
             caches = self.cache_paths()
             for path in (caches.huggingface, caches.vllm, caches.triton, caches.aiter):
                 path.mkdir(parents=True, exist_ok=True)
@@ -276,6 +455,7 @@ class VllmServerPanel(BackendServerPanel):
             "vllm_cache": str(caches.vllm),
             "triton_cache": str(caches.triton),
             "aiter_cache": str(caches.aiter),
+            "offload_cache": str(caches.offload),
         })
         self.notify("vLLM cache paths saved." if saved else "Could not save vLLM cache paths.", severity="information" if saved else "error")
 
@@ -311,8 +491,13 @@ class VllmServerPanel(BackendServerPanel):
             self.notify("Select an engine, vLLM image, and model repository.", severity="error")
             return
         policy = self._effective_policy(policy, str(toolbox_id))
+        toolbox = self.app.toolbox_catalog.toolboxes[toolbox_id]
+        allowed_models = (toolbox.backend_config or {}).get("supported_model_ids")
+        if allowed_models and policy.get("id") not in allowed_models:
+            self.notify("Select a model supported by this toolbox image.", severity="error")
+            return
         self._hf_token = self._hf_token or get_hf_token()
-        if not self._hf_token and not self._hf_token_prompted:
+        if not self._hf_token and not self._hf_token_prompted and not self.query_one("#vllm-local-model", Input).value.strip():
             self.app.push_screen(HfTokenModal(), self._hf_token_received)
             return
         try:
@@ -320,13 +505,34 @@ class VllmServerPanel(BackendServerPanel):
             tp = int(self.query_one("#vllm-tp", SearchableSelect).value)
             sequences = int(self.query_one("#vllm-seqs", Input).value)
             utilization = float(self.query_one("#vllm-util", Input).value)
+            local_value = self.query_one("#vllm-local-model", Input).value.strip()
+            local_directory = Path(local_value).expanduser().resolve() if local_value else None
+            if local_directory is not None and not checkpoint_ready(local_directory):
+                raise ValueError("Local model directory must contain the complete prepared checkpoint and config.json")
+            draft_value = self.query_one("#vllm-draft", Input).value.strip()
+            draft_directory = Path(draft_value).expanduser().resolve() if draft_value else None
+            if draft_directory is not None and not checkpoint_ready(draft_directory, draft=True):
+                raise ValueError("Draft model directory must contain the complete DFlash2 checkpoint and config.json")
+            devices = self.query_one("#vllm-devices", Input).value.strip()
+            if devices:
+                import re
+                if not re.fullmatch(r"[0-9]+(?:,[0-9]+)*", devices) or len(set(devices.split(","))) != len(devices.split(",")) or len(devices.split(",")) != tp:
+                    raise ValueError("Choose distinct GPU indices matching the tensor parallel size")
+                device_key = "ROCR_VISIBLE_DEVICES" if policy.get("runtime_variant") == "tcclaviger" else "HIP_VISIBLE_DEVICES"
+                policy = dict(policy, env={**policy.get("env", {}), device_key: devices})
+                save_backend_settings("vllm", {"devices": devices})
             caches = self.cache_paths()
+            if policy.get("runtime_variant") == "tcclaviger":
+                for suffix in ("", "ple", "tunableop", "lru_store"):
+                    (caches.offload / suffix).mkdir(parents=True, exist_ok=True)
+                if self.query_one("#vllm-reset-caches", CockpitCheckbox).value:
+                    raise ValueError("Disable compiled-cache reset for the persistent tcclaviger PLE profile")
             for path in (caches.huggingface, caches.vllm, caches.triton, caches.aiter):
                 path.mkdir(parents=True, exist_ok=True)
         except (ValueError, OSError) as error:
             self.notify(f"Invalid vLLM setting: {error}", severity="error")
             return
-        toolbox = self.app.toolbox_catalog.toolboxes[toolbox_id]
+        toolbox = self._selected_toolbox(str(toolbox_id))
         profile = self.app.toolbox_catalog.runtime_profiles[toolbox.runtime_profile]
         try:
             self._pending_command = build_server_cmd(
@@ -334,6 +540,9 @@ class VllmServerPanel(BackendServerPanel):
                 image=toolbox.image,
                 engine_args=list(profile.engine_args),
                 model_id=model_id,
+                model_directory=local_directory,
+                speculation=str(self.query_one("#vllm-speculation", SearchableSelect).value),
+                draft_directory=draft_directory,
                 policy=policy,
                 host=self.query_one("#vllm-host", Input).value,
                 port=port,

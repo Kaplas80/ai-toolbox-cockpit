@@ -55,6 +55,12 @@ cd ai-toolbox-cockpit
 pipx install --editable .
 ```
 
+## R9700 engines
+
+The current R9V channel uses ROCm 10 with a 67,840-token context, one sequence, MTP-2 and disk-backed PLE for a 64 GB host. Install it from Toolboxes, then Download / Repair the curated package and Prepare PLE in Models. The earlier R9V channel remains available with its existing context settings. Current qualification covers text serving.
+
+GGZ14 has one toolbox entry with single-card and dual-card builds selected in Server Mode; Radiance and native FP8 provide dual-card profiles. Install their rolling channels from Toolboxes and choose the corresponding curated artifact in Models. MXFP4 preparation creates a separate checkpoint. DFlash2 uses a separate FP8 draft checkpoint and one sequence. Model directories are mounted read-only during serving.
+
 ## Runtime requirements
 
 AI Toolbox Cockpit supports either of these interactive-container combinations:
@@ -97,12 +103,24 @@ Every server endpoint has its own source file and pure command builder under `ai
 | --- | --- |
 | llama.cpp | Local GGUF, image/engine, context, GPU layers, load mode, flash attention, KV-cache type, API key, GPU visibility, inference profiles, vision projector, MTP, and extra `llama-server` arguments |
 | DS4 | Exact local GGUF, context, graph/distributed prefill, disk KV cache, SSD expert streaming, embedded MTP, external MTP or DSpark support model, compatible vision encoder, standalone/coordinator/worker roles, and tensor-parallel TCP/RoCE transport for DeepSeek V4.1 Flash Q2 |
-| vLLM | Hugging Face repository, tensor parallelism, concurrency, context, GPU utilisation, dtype, eager mode, API key, attention backend, and persistent HF/vLLM/Triton/AITER caches |
+| vLLM | Hugging Face repository or read-only local snapshot, tensor parallelism, concurrency, context, GPU utilisation, dtype, eager mode, API key, attention backend, and persistent HF/vLLM/Triton/AITER caches |
 | ComfyUI | Model/input/output/user paths, host/port, BF16 VAE, GPU-only mode, mmap/smart-memory behavior, and cache mode |
 | Gufo (experimental; Strix Halo only) | Revision-pinned Qwen3.8 Flash Next Q4, Qwen3.8 27B Q4, and DeepSeek V4 Flash 0731 GGUF bundles with optional matching BF16 vision projectors for both Qwen profiles; explicit text-only or image-enabled serving; MTP, DFlash2 or DSpark selected by default when its sidecar is ready, with an explicit disabled baseline; context, concurrent sessions, output limit, thinking effort (High by default), per-client queue limit, and localhost binding |
 | Halogen Flash (Strix Halo only) | Qwen3.8-Flash-Next W4B quality/speed bundle, model directory, image/engine, host/port, native request context, KV pool positions, concurrency, and prompt cache |
 
 The vLLM catalog imports the toolbox's model launch recipe rather than replacing it with generic defaults. Model-specific environment variables, parser flags, valid tensor-parallel sizes, eager mode, context, and locked attention implementations are applied by the command builder. DeepSeek V4, for example, keeps its model-specific sparse MLA path and does not receive a generic `--attention-backend` flag.
+
+On R9700, install the rolling GGZ14, Radiance, native-vLLM FP8 or current R9V channel from Toolboxes. Use Update to pull a newer image. In Models, download the exact curated artifact; the AMD 27B MXFP4 target additionally needs **Prepare MXFP4**, which writes a separate checkpoint and converter receipt. The DFlash2 FP8 draft is a separate downloadable artifact. See [GGZ14](https://github.com/kyuz0/amd-r9700-vllm-toolboxes/blob/main/GGZ14.md) and [Radiance](https://github.com/kyuz0/amd-r9700-vllm-toolboxes/blob/main/RADIANCE.md) for engine-specific setup.
+
+**Server Mode → Inference engine** and **Models → Inference engine** list llama.cpp, GGZ14, Radiance, vLLM TheRock, tcclaviger and R9V directly on R9700. Each named engine shows its compatible curated weights and preparation controls. llama.cpp Models defaults to the tested Unsloth Qwen3.8 27B UD-Q4_K_XL and Flash Next UD-Q2_K_XL repositories; the GGUF picker marks and prioritizes the measured quantization, including complete shard sets. Choose **All curated repositories** for other models. The **Model Manager** button on a selected toolbox opens its matching Models view.
+
+Toolboxes lists engine installations. GGZ14 has one entry: use **Server Mode → GPU build** to choose one card (RX9) or two cards (RX6). The matching rolling image and launch settings are selected together. Use **Download / Update build** for that channel; a missing image also downloads on first server launch. For llama.cpp, choose **ROCm 10.0** or **Vulkan RADV**, then use **Server Mode → Model / GPU profile** for the measured Qwen 27B single/dual-card, F16/Q8 KV, or Flash Next disk-PLE settings. These profiles share the installed engine image. Radiance has one toolbox entry; selecting the FP8 or MXFP4 model applies its matching launch settings. Existing containers and model files are preserved when upgrading.
+
+Server Mode offers everyday C1 and explicit measured server allocations. The benchmark's client concurrency is a separate setting. Use **Discover GPUs** in the selected engine image and enter the intended R9700 indices; enumeration can differ between ROCm and Vulkan. Flash Next keeps PLE on disk, and R9V's 64 GB profile disables the older large-context buttons. Rolling builds can change performance; recorded benchmark results identify the actual measured build.
+
+For Flash Next on **two R9700s and a 64 GB host**, select **tcclaviger Flash Next · 2 R9700 cards · 64 GB RAM** in Toolboxes. Install pulls the publisher's rolling `docker.io/tcclaviger/vllm:latest` server image directly. In vLLM Models, download **Qwen3.8 Flash Next · tcclaviger MXFP4/FP8/GPTQ · dual R9700** (about 120 GB); this checkpoint needs no MXFP4 conversion. In vLLM Server, select that image and model, discover/select the two GPU indices, and set **NVMe PLE/cache directory** to persistent NVMe storage with about 42 GB free for PLE plus compiled caches. The first load creates the PLE file; later launches reuse it. This directory is separate from the compiled-cache reset controls.
+
+The tcclaviger defaults reproduce the measured TP2/MTP-3 configuration: 36 GiB expert offload, disk PLE with a 4 GiB row cache, FP8 KV, 131072 maximum context, 16 server slots and a 56 GiB container limit with no container swap. The slot allocation is not a claim of C16 throughput: the measured single-user decode was 100.30 tok/s at zero history and 106.68 at 64K; short C2/C4 tests showed limited scaling. Minimum available host RAM was 2.40 GiB, so leave room for other applications. Host swap and kernel settings are unchanged. See the [tested configuration and results](https://local-llm-benchmarks.dev/tcclaviger.html). Only the dual-card text-serving profile is qualified; the image is a publisher distribution, not a Cockpit source build.
 
 Toolbox-specific policy overrides keep hardware families separate. The GB10 vLLM image uses one GPU, vLLM's automatic CUDA attention selection, and no ROCm-only environment variables.
 
@@ -117,14 +135,14 @@ Server actions are enabled. Starting a server shows its generated command, suspe
 - `llama_cpp.models`: curated GGUF repositories, inference profiles, MTP metadata, vision projector patterns, and compatibility;
 - `ds4.models`: exact filenames, sizes, repositories, family metadata, and server defaults;
 - `r9v.models`: revision-pinned IQ4_XS/FP8-MTP/Q8-vision package with SHA256 hashes and derived PLE metadata;
-- `halogen.models`: revision-pinned HGN bundles with checkpoint, precision overlay, tokenizer files, and expected file sizes;
+- `halogen.models`: revision-pinned HGN bundles with checkpoint, precision overlay or n-gram table, tokenizer files, optional vision, and expected file sizes;
 - `gufo.models`: revision-pinned GGUF target bundles with exact file sizes, MTP/DFlash2/DSpark sidecars, and optional BF16 Qwen vision projectors;
 - `vllm.models`: Hugging Face repository IDs plus the launcher defaults imported from the vLLM toolbox;
 - `comfyui.bundles`: workflow/model families, variant choices, and the toolbox downloader script used by `model_manager`.
 
-The shipped catalog currently contains 31 llama.cpp repositories, 21 DS4 artifacts, three Gufo bundles, one R9V package, four Halogen bundles, 15 vLLM repositories, and 26 ComfyUI bundles.
+The shipped catalog currently contains 31 llama.cpp repositories, 22 DS4 artifacts, three Gufo bundles, one R9V package, six Halogen bundles, 19 vLLM repositories, and 26 ComfyUI bundles.
 
-llama.cpp, DS4, and Gufo downloads are explicit, confirmed Hugging Face CLI operations. A llama.cpp model can also declare auxiliary downloads, such as a fork-specific MTP sidecar repository, without presenting the sidecar as a standalone main model. vLLM downloads from Hub when `vllm serve` resolves a repository. ComfyUI downloads are delegated to the image's workflow-aware manager because one workflow may require several checkpoints, encoders, VAEs, and LoRAs.
+llama.cpp, DS4, and Gufo downloads are explicit, confirmed Hugging Face CLI operations. A llama.cpp model can also declare auxiliary downloads, such as a fork-specific MTP sidecar repository, without presenting the sidecar as a standalone main model. The curated R9700 vLLM artifacts have explicit download/repair actions in Models; other vLLM repositories can download from Hub when `vllm serve` resolves them. ComfyUI downloads are delegated to the image's workflow-aware manager because one workflow may require several checkpoints, encoders, VAEs, and LoRAs.
 
 ### R9V on two R9700 GPUs
 
@@ -144,27 +162,14 @@ NVMe**. The engine is offered only on the R9700 platform. It uses the ROCm 10
    the package plus 26.82 GiB for extracted PLE. Existing files can be reused;
    **Verify SHA256** checks the package and any existing PLE. Scans check sizes.
 4. **Server Mode → R9V:** select the image and package. Defaults are GPU indices
-   `0,1`, TP2, MTP2, 131072 context, 1024-token prefill batches, one sequence,
+   `0,1`, TP2, MTP2, 67840 context, 1024-token prefill batches, one sequence,
    and `http://127.0.0.1:8004/v1` / model `qwen3.8-flash-next`. Set paths, GPU
    indices, API address/port/name and optional API key as needed. Advanced
    controls expose KV memory, dynamic expert-cache slots, logical expert offload,
    sequences and extra vLLM arguments. TP2, MTP2, SSD PLE and synchronous
    scheduling remain fixed.
 
-For **256K text context**, click **Apply 256K settings**: 262144 context,
-4160749568 KV bytes per GPU, zero dynamic expert-cache slots, one sequence and
-1024-token prefill batches. Changing only the context field is insufficient.
-**Apply 128K settings** restores the default memory profile. The 256K profile
-completed 261888 input + 256 output tokens and a separate three-record retrieval
-test on the tested hardware. It has less VRAM headroom and has not undergone
-the 128K profile's extended stability test.
-
-128K remains the default: repeated tests with identical inputs below 130K found
-the 256K profile about 8% slower in prefill and 36–41% slower in decode. Fitting
-256K removes the extra GPU expert cache; cold experts remain in pinned host
-RAM in both profiles. Disabling that cache at 128K also reproduced the decode
-slowdown (84.8 to 51.9 tok/s on identical code output). See the toolbox
-documentation for the memory breakdown and matched results.
+The current rolling channel uses the qualified 64 GB host profile: 1,748,799,488 KV bytes per GPU and 16 dynamic expert-cache slots. Its older 128K/256K preset buttons are disabled. The retained legacy channel keeps those presets; see the toolbox documentation for their supported setup. PLE stays disk-backed.
 
 Startup takes minutes. The model and PLE mounts are read-only; caches use a
 separate directory. API keys are redacted from previews and not saved. Podman
@@ -223,12 +228,12 @@ The API remains reachable through a Cockpit host listener, which forwards each i
 Cockpit follows `ghcr.io/peonist-ai/halogen-flash-server:latest` and uses `--pull=always` with Podman and Docker to fetch the current image before each server launch. The host engine still needs registry access; a failed pull stops the launch. Model downloads also happen separately on the host. Model bundles remain revision-pinned; GPU operation and effective isolation remain experimental until validated on the remote GPU host.
 
 1. Select **AMD Strix Halo**, select Halogen in **Toolboxes**, and use **Create / Update** to pull the image.
-2. In **Models → Halogen Flash**, keep the recommended W4B quality bundle or choose the speed overlay. The download includes the exact checkpoint, selected overlay, and tokenizer from the [upstream weights repository](https://huggingface.co/peonist-ai/halogen-qwen3.8-flash-next), pinned to a revision. Each bundle needs about 118 GiB; the checkpoint and tokenizer are shared between precision choices.
+2. In **Models → Halogen Flash**, keep the default **v2** bundle or select **v2 + vision**. Downloads include `qwen38-flash-next-v2.hgn`, `qwen38-flash-next-ngram.hgn`, and the tokenizer from the [upstream weights repository](https://huggingface.co/peonist-ai/halogen-qwen3.8-flash-next), pinned to revision `3648cf1e6a3143e8946d52301570f26003c0bdb0`. The text bundle needs 109.8 GiB; vision adds 0.84 GiB. v2 requires Halogen server 0.15 or newer and carries its own precision, so it needs no W4B overlay. W4B quality/speed bundles remain available (about 118 GiB). Downloading v2 keeps existing W4B files; allow space for both if keeping them together.
 3. The default folder is `~/halogen-models`. **Save Path** creates and saves a different folder; **Download / Repair** also uses the edited folder, creates it after confirmation, and resumes interrupted transfers. Disk availability and local bundle readiness are shown. An optional Hugging Face token uses Cockpit's existing token handling.
-4. In **Server Mode → Halogen Flash**, select the matching precision bundle and start it. Required file sizes are checked before launch, including the selected overlay and tokenizer. This detects missing/truncated files, but is not a checksum verification. Individual bundle files are mounted read-only and the image's own entrypoint starts both engine and API. The host API relay defaults to `127.0.0.1:8731`.
+4. In **Server Mode → Halogen Flash**, select the matching bundle and start it. New selections default to v2; an existing saved bundle choice is preserved. Required file sizes are checked before launch, including the n-gram table or W4B overlay and tokenizer. For v2, Cockpit sets `HALOGEN_NGRAM_TABLE` and `HALOGEN_CK_OVERLAY=none`. This detects missing/truncated files, but is not a checksum verification. Individual bundle files are mounted read-only and the image's own entrypoint starts both engine and API. The host API relay defaults to `127.0.0.1:8731`.
 5. Adjust native request context (up to 262144), KV pool positions, slots, or prompt-cache mode as needed. Defaults follow release 0.5.4; extended YaRN context is not exposed. Ctrl+C stops the server and returns to Cockpit.
 
-For image input, download a **+ vision** bundle and select it in Server Mode. It adds the optional `qwen38-flash-next-vision.hgn` sidecar (0.84 GiB), reusing the checkpoint, overlay, and tokenizer. Cockpit checks the sidecar before launch and sets `HALOGEN_VISION_TOWER` to its mounted path. Text bundles leave vision off. Both `/v1/chat/completions` and `/v1/responses` accept images as data URLs or base64; upstream refuses remote HTTP(S) image URLs. The server's default image limit is 2560×1440 pixels before downscaling. See the [upstream image flags](https://github.com/peonist-ai/halogen-flash-server/blob/main/docs/FLAGS.md#images).
+For image input, download a **+ vision** bundle and select it in Server Mode. It adds the optional `qwen38-flash-next-vision.hgn` sidecar (0.84 GiB), reusing the checkpoint, n-gram table or W4B overlay, and tokenizer. Cockpit checks the sidecar before launch and sets `HALOGEN_VISION_TOWER` to its mounted path. Text bundles leave vision off. Both `/v1/chat/completions` and `/v1/responses` accept images as data URLs or base64; upstream refuses remote HTTP(S) image URLs. The server's default image limit is 2560×1440 pixels before downscaling. See the [upstream image flags](https://github.com/peonist-ai/halogen-flash-server/blob/main/docs/FLAGS.md#images).
 
 The `toolbox_compatible: false` field in `toolboxes.json` selects the shared server-only image lifecycle. It defaults to `true` for existing toolboxes. A server-only record must declare interactive support unavailable and server support available or experimental.
 

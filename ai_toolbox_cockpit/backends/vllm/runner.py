@@ -1,8 +1,9 @@
 """Pure vLLM direct-container command builder."""
 
+import json
 import os
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ai_toolbox_cockpit.runtime.engines import adapt_nvidia_runtime_args
@@ -15,6 +16,21 @@ class VllmCachePaths:
     vllm: Path
     triton: Path
     aiter: Path
+    offload: Path = Path("~/.cache/tcclaviger-r9700")
+
+
+def apply_gpu_profile(toolbox, profile_id: str = ""):
+    """Resolve a maintained GPU build and its matching policy as one choice."""
+    config = toolbox.backend_config or {}
+    profiles = config.get("gpu_profiles", {})
+    if not profiles:
+        return toolbox
+    selected = profile_id or next(iter(profiles))
+    if selected not in profiles:
+        raise ValueError(f"Unknown GPU profile: {selected}")
+    profile = profiles[selected]
+    return replace(toolbox, image=profile["image"],
+                   backend_config={**config, "policy_overrides": profile["policy_overrides"]})
 
 
 def apply_toolbox_policy_overrides(policy: dict, backend_config: dict | None) -> dict:
@@ -24,6 +40,7 @@ def apply_toolbox_policy_overrides(policy: dict, backend_config: dict | None) ->
         overrides = backend_config.get("policy_overrides", {})
         if isinstance(overrides, dict):
             result.update(overrides)
+        result.update(backend_config.get("model_policy_overrides", {}).get(policy.get("id"), {}))
     return result
 
 
@@ -56,6 +73,9 @@ def build_server_cmd(
     hf_token: str = "",
     extra_args: str = "",
     cache_paths: VllmCachePaths | None = None,
+    model_directory: Path | None = None,
+    speculation: str = "baseline",
+    draft_directory: Path | None = None,
 ) -> list[str]:
     if not model_id.strip():
         raise ValueError("model_id is required")
@@ -63,6 +83,34 @@ def build_server_cmd(
         raise ValueError(f"Tensor parallel size {tensor_parallel} is not permitted for {model_id}")
     if port <= 0 or max_num_seqs <= 0 or not 0 < gpu_memory_utilization <= 1:
         raise ValueError("port, max sequences, and GPU utilization are invalid")
+
+    tcclaviger = policy.get("runtime_variant") == "tcclaviger"
+    if tcclaviger and (model_directory is None or speculation != "mtp"):
+        raise ValueError("tcclaviger requires the downloaded Flash Next checkpoint and MTP-3")
+
+    speculative_config = None
+    draft_path = None
+    if speculation != "baseline":
+        recipe = policy.get("speculation", {}).get(speculation)
+        if speculation not in {"dflash2", "mtp"} or not recipe:
+            raise ValueError("The selected toolbox/model does not support this speculative mode")
+        if speculation == "dflash2":
+            if max_num_seqs != 1:
+                raise ValueError("This qualified DFlash2 profile supports one sequence")
+            if draft_directory is None:
+                raise ValueError("DFlash2 requires a local draft model directory")
+            draft_path = draft_directory.expanduser().resolve()
+            if any(char in str(draft_path) for char in (":", "\n", "\r", "\0")):
+                raise ValueError("Draft model directory cannot contain colons or control characters")
+            speculative_config = dict(recipe["config"], model="/models/draft")
+        else:
+            if draft_directory is not None:
+                raise ValueError("Embedded MTP does not use a separate draft directory")
+            speculative_config = dict(recipe["config"])
+        policy = dict(policy, env={**policy.get("env", {}), **recipe.get("env", {})},
+                      extra_flags=recipe.get("extra_flags", policy.get("extra_flags", [])))
+    elif draft_directory is not None:
+        raise ValueError("Select DFlash2 before supplying a draft model directory")
 
     cleaned: list[str] = []
     skip = False
@@ -81,10 +129,18 @@ def build_server_cmd(
     caches = cache_paths or default_cache_paths()
     command = [engine, "run", "--rm", "-it", "--name", "ai-toolbox-cockpit-vllm-server"]
     command.extend(cleaned)
-    command.extend(["--ipc=host", "--cap-add=SYS_PTRACE"])
+    if tcclaviger:
+        command.extend(["--memory=56g", "--memory-swap=56g", "--shm-size=32g",
+                        "--ulimit", "memlock=-1:-1", "--entrypoint", "/usr/bin/env"])
+        if engine == "podman":
+            command.extend(["--runtime", "crun"])
+    else:
+        command.extend(["--ipc=host", "--cap-add=SYS_PTRACE"])
     if engine == "podman":
-        command.extend(["--security-opt", "label=disable", "--userns=keep-id"])
-    elif engine == "docker":
+        command.extend(["--security-opt", "label=disable"])
+        if not tcclaviger:
+            command.append("--userns=keep-id")
+    elif engine == "docker" and not tcclaviger:
         command.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
 
     bind_host = "127.0.0.1" if host == "localhost" else host
@@ -106,10 +162,33 @@ def build_server_cmd(
     )
     for host_path, container_path in mounts:
         command.extend(["-v", f"{host_path}:{container_path}"])
+    if tcclaviger:
+        offload = caches.offload.expanduser().resolve()
+        if any(char in str(offload) for char in (":", "\n", "\r", "\0")):
+            raise ValueError("NVMe cache directory cannot contain colons or control characters")
+        for source, target in ((offload, "/cache"), (offload / "ple", "/app/pleoffload"),
+                               (offload / "tunableop", "/tunableop"), (offload / "lru_store", "/lru_store")):
+            command.extend(["-v", f"{source}:{target}:rw"])
     for key, value in policy.get("env", {}).items():
         command.extend(["-e", f"{key}={value}"])
 
-    command.extend([image, "vllm", "serve", model_id])
+    model_ref = model_id
+    if model_directory is not None:
+        directory = model_directory.expanduser().resolve()
+        if any(char in str(directory) for char in (":", "\n", "\r", "\0")):
+            raise ValueError("Local model directory cannot contain colons or control characters")
+        command.extend(["-v", f"{directory}:/models/target:ro"])
+        model_ref = "/models/target"
+    elif policy.get("requires_local_model"):
+        raise ValueError("This prepared checkpoint requires a local model directory")
+    if draft_path is not None:
+        command.extend(["-v", f"{draft_path}:/models/draft:ro"])
+    if tcclaviger:
+        command.extend(["--workdir", "/app", image, "/app/tools/image_entrypoint.sh", model_ref])
+    else:
+        command.extend(["--workdir", "/workspace", image, "vllm", "serve", model_ref])
+    if model_directory is None and policy.get("revision"):
+        command.extend(["--revision", str(policy["revision"])])
     resolved_model_len = policy.get("ctx", "auto") if max_model_len == "auto" else max_model_len
     command.extend([
         "--host", "0.0.0.0",
@@ -131,5 +210,15 @@ def build_server_cmd(
     if configured_backend is not None:
         command.extend(["--attention-backend", attention_backend or configured_backend])
     command.extend(str(item) for item in policy.get("extra_flags", []))
+    if speculative_config is not None:
+        command.extend(["--speculative-config", json.dumps(speculative_config, separators=(",", ":"))])
     command.extend(shlex.split(extra_args) if extra_args else [])
     return command
+
+
+def build_device_probe_cmd(engine: str, image: str, engine_args: list[str]) -> list[str]:
+    if engine not in {"podman", "docker"}:
+        raise ValueError("Choose Podman or Docker")
+    arguments = upgrade_groups_for_podman(engine, adapt_nvidia_runtime_args(engine, list(engine_args)))
+    probe = "import json,torch; print(json.dumps([{'index':i,'name':torch.cuda.get_device_name(i),'architecture':getattr(torch.cuda.get_device_properties(i),'gcnArchName','')} for i in range(torch.cuda.device_count())]))"
+    return [engine, "run", "--rm", "--network=none", *arguments, "--entrypoint", "/opt/vllm/bin/python", image, "-c", probe]

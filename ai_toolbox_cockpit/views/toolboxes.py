@@ -7,7 +7,7 @@ from rich.text import Text
 from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, DataTable, Label, Static
+from textual.widgets import Button, DataTable, Label, Static, TabbedContent
 
 from ai_toolbox_cockpit.backends import BACKENDS, backend_options
 from ai_toolbox_cockpit.catalog import ToolboxCatalog
@@ -208,9 +208,7 @@ class ToolboxesView(Vertical):
         )
         self.query_one("#toolbox-model-manager", Button).disabled = not (
             len(selected) == 1
-            and len(installed) == 1
-            and selected[0].backend == "comfyui"
-            and selected[0].toolbox_compatible
+            and (selected[0].backend != "comfyui" or (len(installed) == 1 and selected[0].toolbox_compatible))
         )
         self.query_one("#toolbox-set-default", Button).disabled = len(selected) != 1
         self.query_one("#toolbox-delete", Button).disabled = not (
@@ -278,11 +276,17 @@ class ToolboxesView(Vertical):
 
     @work(thread=True, exclusive=True, group="toolbox-updates")
     def check_updates_for_create(self, toolboxes: tuple[Toolbox, ...]) -> None:
-        dates = {
-            toolbox.id: get_remote_image_date(toolbox.image) or "—"
-            for toolbox in toolboxes
-            if toolbox.toolbox_compatible and toolbox.container_name in self.installed
-        }
+        dates = {}
+        for toolbox in toolboxes:
+            installed = self.installed.get(toolbox.container_name)
+            if not toolbox.toolbox_compatible or installed is None:
+                continue
+            if (toolbox.backend_config or {}).get("local_image", False):
+                images = inspect_local_images((toolbox.image,), engines=(installed.engine,))
+                local = images.get(toolbox.image)
+                dates[toolbox.id] = local.created if local else "—"
+            else:
+                dates[toolbox.id] = get_remote_image_date(toolbox.image) or "—"
         self.app.call_from_thread(self._apply_create_update_dates, toolboxes, dates)
 
     def _apply_create_update_dates(
@@ -306,7 +310,7 @@ class ToolboxesView(Vertical):
                 if not engines:
                     self.notify("Install Podman or Docker to pull server images.", severity="error")
                     return
-                self._pending_image_commands[toolbox.id] = ImageCommands(engines[0]).pull(toolbox.image)
+                self._pending_image_commands[toolbox.id] = ImageCommands(engines[0]).pull(toolbox.image, local_only=(toolbox.backend_config or {}).get("local_image", False))
                 to_create.append(toolbox)
                 continue
             installed = self.installed.get(toolbox.container_name)
@@ -323,7 +327,7 @@ class ToolboxesView(Vertical):
             if check_failed:
                 names = ", ".join(toolbox.container_name for toolbox in check_failed)
                 self.notify(
-                    f"Could not check registry updates for: {names}.",
+                    f"Could not check image updates for: {names}.",
                     severity="error",
                 )
             else:
@@ -363,7 +367,7 @@ class ToolboxesView(Vertical):
                 self.notify(self.missing_runtime_message(toolbox), severity="error")
                 return
             profile = self.catalog.runtime_profiles[toolbox.runtime_profile]
-            commands.append(build_pull_command(toolbox_runtime, toolbox.image))
+            commands.append(build_pull_command(toolbox_runtime, toolbox.image, local_only=(toolbox.backend_config or {}).get("local_image", False)))
             commands.append(
                 build_create_command(
                     toolbox_runtime,
@@ -375,7 +379,7 @@ class ToolboxesView(Vertical):
         preview = "\n".join(shlex.join(command) for command in commands)
         self.app.push_screen(
             ConfirmModal(
-                f"Pull images and create/update: {names}?{update_warning}"
+                f"Prepare images and create/update: {names}?{update_warning}"
                 + ("\n\nServer-only images will only be pulled. Open Server Mode to start them."
                    if self._pending_image_commands else "")
                 + f"\n\nCommands:\n{preview}",
@@ -410,7 +414,7 @@ class ToolboxesView(Vertical):
                         raise RuntimeError(self.missing_runtime_message(toolbox))
                     profile = self.catalog.runtime_profiles[toolbox.runtime_profile]
                     print(f"Pulling {toolbox.image} and creating {toolbox.container_name}...")
-                    create_toolbox(toolbox_runtime, toolbox.container_name, toolbox.image, profile.engine_args)
+                    create_toolbox(toolbox_runtime, toolbox.container_name, toolbox.image, profile.engine_args, local_only=(toolbox.backend_config or {}).get("local_image", False))
             except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                 operation_error = error
                 pause_after_failure(f"Toolbox operation failed: {error}")
@@ -542,9 +546,14 @@ class ToolboxesView(Vertical):
     def model_manager_pressed(self) -> None:
         selected = self.selected()
         if len(selected) != 1:
-            self.notify("Select exactly one installed ComfyUI toolbox.", severity="warning")
+            self.notify("Select exactly one engine.", severity="warning")
             return
         toolbox = selected[0]
+        if toolbox.backend != "comfyui":
+            selector = (toolbox.backend_config or {}).get("engine_selector", {})
+            self.app.query_one("#model-backend-select", SearchableSelect).value = selector.get("id", toolbox.backend)
+            self.app.query_one(TabbedContent).active = "tab-models"
+            return
         if not toolbox.toolbox_compatible or toolbox.backend != "comfyui" or toolbox.container_name not in self.installed:
             self.notify("The toolbox model manager is currently provided by installed ComfyUI toolboxes.", severity="warning")
             return

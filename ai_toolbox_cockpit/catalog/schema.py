@@ -9,7 +9,7 @@ FEATURE_STATES = frozenset({"supported", "experimental", "unavailable"})
 FEATURE_IDS = frozenset({"interactive", "models", "server"})
 CHANNELS = frozenset({"stable", "development", "experimental"})
 MATURITY_STATES = frozenset({"stable", "experimental"})
-LLAMA_KV_CACHE_TYPES = frozenset({"default", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"})
+LLAMA_KV_CACHE_TYPES = frozenset({"default", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"})
 LLAMA_LOAD_MODES = frozenset({"none", "mmap", "dio"})
 MODEL_KINDS = {
     "r9v": "r9v_package",
@@ -165,7 +165,7 @@ def _validate_model_entry(backend_id: str, entry: dict[str, Any], context: str) 
                 or not re.fullmatch(r"[0-9a-f]{64}", str(ple.get("sha256", "")))):
             raise CatalogError(f"{context}.ple must specify the extracted filename, size and SHA256")
     elif backend_id == "halogen":
-        for key in ("repo", "revision", "quant", "checkpoint", "overlay", "tokenizer_dir"):
+        for key in ("repo", "revision", "quant", "checkpoint", "tokenizer_dir"):
             _required_string(entry, key, context)
         files = entry.get("files")
         if not isinstance(files, list) or not files:
@@ -182,13 +182,17 @@ def _validate_model_entry(backend_id: str, entry: dict[str, Any], context: str) 
             size = item.get("size_bytes")
             if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
                 raise CatalogError(f"{context}.files.size_bytes must be a positive integer")
-        required = {entry["checkpoint"], entry["overlay"],
+        if ("overlay" in entry) == ("ngram_table" in entry):
+            raise CatalogError(f"{context} requires exactly one of overlay or ngram_table")
+        companion_key = "overlay" if "overlay" in entry else "ngram_table"
+        companion = _required_string(entry, companion_key, context)
+        required = {entry["checkpoint"], companion,
                     f"{entry['tokenizer_dir']}/tokenizer.json",
                     f"{entry['tokenizer_dir']}/tokenizer_config.json"}
         if not required.issubset(paths):
-            raise CatalogError(f"{context}.files must include checkpoint, overlay and tokenizer")
-        if not entry["checkpoint"].endswith(".hgn") or not entry["overlay"].endswith(".hgn"):
-            raise CatalogError(f"{context} requires HGN checkpoint and overlay files")
+            raise CatalogError(f"{context}.files must include checkpoint, {companion_key} and tokenizer")
+        if not entry["checkpoint"].endswith(".hgn") or not companion.endswith(".hgn"):
+            raise CatalogError(f"{context} requires HGN checkpoint and {companion_key} files")
         if "vision_tower" in entry:
             tower = _required_string(entry, "vision_tower", context)
             if tower not in paths or not tower.endswith(".hgn"):
@@ -304,6 +308,30 @@ def _validate_model_entry(backend_id: str, entry: dict[str, Any], context: str) 
                 )
     elif backend_id == "vllm":
         _required_string(entry, "repo", context)
+        if "download" in entry:
+            revision = _required_string(entry, "revision", context)
+            if not re.fullmatch(r"[0-9a-f]{40}", revision):
+                raise CatalogError(f"{context}.revision must identify the model artifact")
+            download = entry["download"]
+            if not isinstance(download, dict):
+                raise CatalogError(f"{context}.download must be an object")
+            _required_string(download, "directory", context)
+            files = download.get("files")
+            if not isinstance(files, list) or not files:
+                raise CatalogError(f"{context}.download.files must be nonempty")
+            paths = set()
+            for item in files:
+                path = _required_string(item, "path", context)
+                if PurePosixPath(path).is_absolute() or ".." in path.split("/") or "\\" in path or path.startswith("-") or path in paths:
+                    raise CatalogError(f"{context}.download.files contains an invalid path")
+                paths.add(path)
+                if type(item.get("size_bytes")) is not int or item["size_bytes"] <= 0:
+                    raise CatalogError(f"{context}.download.files requires positive byte counts")
+                if "sha256" in item and not re.fullmatch(r"[0-9a-f]{64}", str(item["sha256"])):
+                    raise CatalogError(f"{context}.download.files has an invalid hash")
+            if "config.json" not in paths or not any(path.endswith(".safetensors") for path in paths):
+                raise CatalogError(f"{context}.download.files requires config and weights")
+
         valid_tp = entry.get("valid_tp")
         if not isinstance(valid_tp, list) or not valid_tp or not all(isinstance(value, int) and value > 0 for value in valid_tp):
             raise CatalogError(f"{context}.valid_tp must contain positive integers")
@@ -376,10 +404,37 @@ def _validate_calibrated_ubatches(
             raise CatalogError(f"{record_context}.source_job_status is unsupported")
 
 
+def _validate_performance_profiles(backend_config: dict, backend: str, context: str) -> None:
+    performance = backend_config.get("performance_profiles", {})
+    if not isinstance(performance, dict):
+        raise CatalogError(f"{context}.performance_profiles must be an object")
+    fields = {"llama_cpp": {"context_size", "parallel_sequences", "batch_size", "ubatch_size"}, "vllm": {"max_num_seqs"}}.get(backend, set())
+    for key, profile in performance.items():
+        _required_string(profile, "name", context)
+        _required_string(profile, "note", context)
+        defaults = profile.get("server_defaults", {})
+        if not isinstance(defaults, dict) or not defaults or set(defaults) - fields or any(type(value) is not int or value <= 0 for value in defaults.values()):
+            raise CatalogError(f"{context}.performance_profiles has unsupported server settings")
+        concurrency = profile.get("client_concurrency", [])
+        if not isinstance(concurrency, list) or not concurrency or any(type(value) is not int or not 1 <= value <= 16 for value in concurrency):
+            raise CatalogError(f"{context}.performance_profiles has invalid client concurrency")
+
+
 def _validate_llama_toolbox_backend_config(
     config: dict[str, Any], context: str
 ) -> None:
     """Validate optional llama.cpp policy owned by one toolbox/fork."""
+    profiles = config.get("launch_profiles", {})
+    if not isinstance(profiles, dict):
+        raise CatalogError(f"{context}.launch_profiles must be an object")
+    for key, profile in profiles.items():
+        if not isinstance(profile, dict) or "launch_profiles" in profile:
+            raise CatalogError(f"{context}.launch_profiles must contain flat profile objects")
+        _required_string(profile, "name", context)
+        if set(profile) - {"name", "recommended_use", "performance_profiles"}:
+            raise CatalogError(f"{context}.launch_profiles has unsupported fields")
+        _validate_performance_profiles(profile, "llama_cpp", context)
+        _validate_llama_toolbox_backend_config(profile, f"{context}.launch_profiles.{key}")
     recommended = config.get("recommended_use")
     if recommended is None:
         return
@@ -637,6 +692,31 @@ class ToolboxCatalog:
             backend_config = raw.get("backend_config", {})
             if not isinstance(backend_config, dict):
                 raise CatalogError(f"{context}.backend_config must be an object")
+            local_image = backend_config.get("local_image", False)
+            if not isinstance(local_image, bool) or (local_image and not image.startswith("localhost/")):
+                raise CatalogError(f"{context}.backend_config.local_image must be boolean and local images must use a localhost/ reference")
+            preparation = backend_config.get("checkpoint_preparation")
+            if preparation is not None and (backend != "vllm" or preparation != "ggz14-mtp-fp8"):
+                raise CatalogError(f"{context}.checkpoint_preparation is unsupported")
+            selector = backend_config.get("engine_selector")
+            if selector is not None:
+                if backend != "vllm" or not isinstance(selector, dict) or set(selector) != {"id", "label"}:
+                    raise CatalogError(f"{context}.engine_selector requires a vLLM id/label mapping")
+                _required_string(selector, "id", context)
+                _required_string(selector, "label", context)
+            gpu_profiles = backend_config.get("gpu_profiles", {})
+            if not isinstance(gpu_profiles, dict) or (gpu_profiles and backend != "vllm"):
+                raise CatalogError(f"{context}.gpu_profiles requires a vLLM profile mapping")
+            for key, profile in gpu_profiles.items():
+                if not isinstance(profile, dict) or set(profile) != {"name", "image", "policy_overrides"}:
+                    raise CatalogError(f"{context}.gpu_profiles.{key} requires name, image and policy_overrides")
+                _required_string(profile, "name", context)
+                reference = _required_string(profile, "image", context)
+                if "/" not in reference or (":" not in reference and "@" not in reference):
+                    raise CatalogError(f"{context}.gpu_profiles.{key}.image must be a complete tagged OCI reference")
+                if not isinstance(profile["policy_overrides"], dict):
+                    raise CatalogError(f"{context}.gpu_profiles.{key}.policy_overrides must be an object")
+            _validate_performance_profiles(backend_config, backend, context)
             if backend == "llama_cpp":
                 _validate_llama_toolbox_backend_config(
                     backend_config, f"{context}.backend_config"
@@ -715,6 +795,15 @@ class ToolboxCatalog:
             if platform.id == platform_id:
                 return platform
         raise KeyError(platform_id)
+
+    def resolve_toolbox_id(self, toolbox_id: str) -> str:
+        """Resolve retired preset IDs only for saved preferences, never catalogue rows."""
+        if toolbox_id in self.toolboxes:
+            return toolbox_id
+        for toolbox in self.toolboxes.values():
+            if toolbox_id in (toolbox.backend_config or {}).get("legacy_toolbox_ids", []):
+                return toolbox.id
+        return toolbox_id
 
     def platform_toolboxes(self, platform_id: str) -> tuple[Toolbox, ...]:
         platform = self.platform(platform_id)
